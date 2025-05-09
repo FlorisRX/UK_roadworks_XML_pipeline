@@ -1,4 +1,7 @@
 *.duckdb
+*.duckdb.wal
+notebook.txt
+notebook.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
