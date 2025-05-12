@@ -1,3 +1,5 @@
+# Project-specific files
+*.xml
 roadworks_data.duckdb
 *.duckdb
 *.duckdb.wal
