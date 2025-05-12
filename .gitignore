@@ -1,3 +1,4 @@
+roadworks_data.duckdb
 *.duckdb
 *.duckdb.wal
 notebook.txt
