@@ -1,0 +1,1107 @@
+# %%
+import duckdb
+import glob
+import os
+import polars as pl
+from IPython.display import display
+from lxml import etree
+import time # Add time module
+import psutil # Add psutil module
+
+# --- Configuration ---
+DUCKDB_FILE = 'data/roadworks_data.duckdb'
+RAW_NEW_TABLE_NAME = 'raw_new_roadworks'
+RAW_OLD_TABLE_NAME = 'raw_old_roadworks'
+TEMP_UNIFIED_TABLE_NAME = 'temp_uk_roadworks_staging' # Temporary table before deduplication
+UK_ROADWORKS_FINAL = f"uk_roadworks_deduplicated" # Final, persistent deduplicated table
+
+NEW_DATA_DIRECTORY = 'data/new_format'     # data from Sept 2017 onwards
+OLD_DATA_DIRECTORY = 'data/old_format'     # data from August 2017 and earlier
+
+# Define the namespace map
+NSMAP = {'d': 'WebTeam'}
+
+# XPath to find the repeating record element
+NEW_ROADWORK_RECORD_XPATH = './/d:HE_PLANNED_WORKS'
+OLD_ROADWORK_RECORD_XPATH = './/ha_planned_works'
+
+# Columns for the 'new' format raw table
+RAW_NEW_COLUMNS = [
+    'source_filename', 'NEW_EVENT_NUMBER', 'OLD_REFERENCE_NUMBER', 'SDATE', 'EDATE',
+    'EXPDEL', 'DESCRIPTION', 'CLOSURE_TYPE', 'STATUS', 'PUBLISHED_DATE',
+    'CENTRE_EASTING', 'CENTRE_NORTHING', 'ROAD_NUMBERS'
+]
+
+# Columns for the 'old' format raw table
+RAW_OLD_COLUMNS = [
+    'source_filename', 'reference_number', 'start_date', 'end_date', 'expected_delay',
+    'description', 'closure_type', 'status', 'published_date', 'centre_easting',
+    'centre_northing', 'road', 'location', 'local_authority', 'traffic_management'
+]
+
+# Define XPaths for nested data relative to the NEW format HE_PLANNED_WORKS element
+NEW_COORD_XPATH = './d:EASTNORTH/d:Report/d:EASTINGNORTHING/d:EASTNORTH_Collection/d:EASTNORTH'
+NEW_ROAD_XPATH = './d:ROADS/d:Report/d:ROADS/d:ROAD_Collection/d:ROAD'
+
+
+# --- Helper function to run queries (optional, or use con.sql().pl() directly) ---
+def run_query_df(connection, sql_query):
+    """Helper function to run a query and return a Polars DataFrame."""
+    if not connection:
+        print("Error: Database connection is not established.")
+        return None
+    try:
+        return connection.sql(sql_query).pl()
+    except duckdb.Error as e:
+        print(f"Error running query:\n{sql_query}\nError: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None
+
+# --- Connect to DuckDB ---
+con = None
+try:
+    con = duckdb.connect(database=DUCKDB_FILE, read_only=False)
+    print(f"Successfully connected to {DUCKDB_FILE}")
+except Exception as e:
+    print(f"Failed to connect to DuckDB: {e}")
+
+pl.Config.set_tbl_rows(50)
+
+# %% [markdown]
+# ## A. Define XML Parsing and Data Loading Utilities
+
+# %%
+def extract_record_new_format(record_element, source_filename):
+    """
+    Extracts raw data from a 'new' format <HE_PLANNED_WORKS> element
+    into a dictionary matching RAW_NEW_COLUMNS.
+    """
+    data = {col: None for col in RAW_NEW_COLUMNS} 
+    data['source_filename'] = source_filename
+
+    data['NEW_EVENT_NUMBER'] = record_element.get('NEW_EVENT_NUMBER')
+    data['OLD_REFERENCE_NUMBER'] = record_element.get('OLD_REFERENCE_NUMBER')
+    data['SDATE'] = record_element.get('SDATE')
+    data['EDATE'] = record_element.get('EDATE')
+    data['EXPDEL'] = record_element.get('EXPDEL')
+    data['DESCRIPTION'] = record_element.get('DESCRIPTION')
+    data['CLOSURE_TYPE'] = record_element.get('CLOSURE_TYPE')
+    data['STATUS'] = record_element.get('STATUS')
+    data['PUBLISHED_DATE'] = record_element.get('PUBLISHED_DATE')
+
+    if data.get('NEW_EVENT_NUMBER') is None:
+        return None
+
+    coord_elements = record_element.xpath(NEW_COORD_XPATH, namespaces=NSMAP)
+    if coord_elements:
+        coord_element = coord_elements[0]
+        data['CENTRE_EASTING'] = coord_element.get('CENTRE_EASTING')
+        data['CENTRE_NORTHING'] = coord_element.get('CENTRE_NORTHING')
+
+    road_elements = record_element.xpath(NEW_ROAD_XPATH, namespaces=NSMAP)
+    if road_elements:
+        road_numbers_list = [road.get('ROAD_NUMBER') for road in road_elements if road.get('ROAD_NUMBER')]
+        data['ROAD_NUMBERS'] = '; '.join(road_numbers_list) if road_numbers_list else None
+    return data
+
+def extract_record_old_format(record_element, source_filename):
+    """
+    Extracts raw data from an 'old' format <ha_planned_works> element
+    into a dictionary matching RAW_OLD_COLUMNS.
+    """
+    data = {col: None for col in RAW_OLD_COLUMNS}
+    data['source_filename'] = source_filename
+
+    def get_text(tag_name):
+        element = record_element.find(tag_name)
+        return element.text.strip() if element is not None and element.text else None
+
+    for col_name in RAW_OLD_COLUMNS:
+        if col_name != 'source_filename':
+             data[col_name] = get_text(col_name)
+
+    if data.get('reference_number') is None:
+        return None
+    return data
+
+def process_directory(directory_path, record_xpath, extraction_func, nsmap=None):
+    """
+    Processes all XML files in a directory, yielding each processed record.
+    """
+    xml_files = glob.glob(os.path.join(directory_path, '*.xml'))
+    parser = etree.XMLParser(recover=True, ns_clean=True)
+
+    if not xml_files:
+        print(f"Warning: No XML files found in directory: {directory_path}")
+        return
+
+    print(f"\n--- Processing Directory: {directory_path} ---")
+    total_yielded_records = 0
+    for file_path in xml_files:
+        filename = os.path.basename(file_path)
+        try:
+            tree = etree.parse(file_path, parser)
+            root = tree.getroot()
+            records = root.xpath(record_xpath, namespaces=nsmap)
+            for record in records:
+                extracted_dict = extraction_func(record, filename)
+                if extracted_dict:
+                    yield extracted_dict
+                    total_yielded_records += 1
+        except Exception as e_file:
+            print(f"  Error processing file {filename}: {e_file}. Skipping file.")
+    print(f"--- Directory Scan Complete: {directory_path}. Yielded {total_yielded_records} records. ---")
+
+def load_data_in_batches(db_connection, table_name, target_columns, data_iterator, batch_size=1000, log_interval_seconds=10):
+    """
+    Loads data from an iterator into a DuckDB table in batches, logging memory and throughput.
+    """
+    batch_data = []
+    total_inserted = 0
+    placeholders = ', '.join(['?'] * len(target_columns))
+    # Explicitly list columns in the INSERT statement
+    column_names_str = ', '.join([f'"{col}"' for col in target_columns])
+    insert_sql = f'INSERT INTO "{table_name}" ({column_names_str}) VALUES ({placeholders})'
+
+    process = psutil.Process(os.getpid())
+    start_time_total = time.time()
+    last_log_time = start_time_total
+    records_since_last_log = 0
+
+    print(f"Starting batch insertion into '{table_name}' with batch_size {batch_size}...")
+    initial_mem_usage = process.memory_info().rss / (1024 * 1024) # MB
+    print(f"Initial memory usage: {initial_mem_usage:.2f} MB")
+
+    for i, record_dict in enumerate(data_iterator):
+        row_values = [record_dict.get(col_name) for col_name in target_columns]
+        batch_data.append(row_values)
+        records_since_last_log += 1
+        
+        if len(batch_data) >= batch_size:
+            try:
+                db_connection.executemany(insert_sql, batch_data)
+                total_inserted += len(batch_data)
+                batch_data = []
+            except duckdb.Error as e:
+                print(f"  Error inserting batch: {e}")
+                # Optionally, decide how to handle batch errors, e.g., skip, log, retry
+                batch_data = [] # Clear batch even on error to prevent reprocessing same error
+            
+        current_time = time.time()
+        if current_time - last_log_time >= log_interval_seconds or len(batch_data) == 0 and i > 0 and (i + 1) % batch_size == 0 : # Log at interval or after a full batch if interval not met
+            elapsed_interval = current_time - last_log_time
+            if elapsed_interval > 0 and records_since_last_log > 0:
+                throughput = records_since_last_log / elapsed_interval
+                current_mem_usage = process.memory_info().rss / (1024 * 1024) # MB
+                print(f"  {time.strftime('%H:%M:%S')} - Processed {records_since_last_log} records in last {elapsed_interval:.2f}s ({throughput:.2f} records/sec). Current Mem: {current_mem_usage:.2f} MB. Total Inserted: {total_inserted}")
+            records_since_last_log = 0
+            last_log_time = current_time
+
+    if batch_data: # Insert any remaining data
+        try:
+            db_connection.executemany(insert_sql, batch_data)
+            total_inserted += len(batch_data)
+        except duckdb.Error as e:
+            print(f"  Error inserting final batch: {e}")
+
+    end_time_total = time.time()
+    total_duration = end_time_total - start_time_total
+    final_mem_usage = process.memory_info().rss / (1024 * 1024) # MB
+    avg_throughput = total_inserted / total_duration if total_duration > 0 else 0
+    
+    print(f"Batch insertion complete for '{table_name}'. Total records inserted: {total_inserted}")
+    print(f"Final memory usage: {final_mem_usage:.2f} MB.")
+    print(f"Total time: {total_duration:.2f} seconds. Average throughput: {avg_throughput:.2f} records/sec.")
+
+# %% [markdown]
+# ## B. Load Raw XML Data into Staging Tables
+
+# %%
+batch_size = 1000
+
+if con:
+    # --- Create RAW NEW Table Structure if it doesn't exist ---
+    print(f"Ensuring table exists: {RAW_NEW_TABLE_NAME}")
+    new_column_defs = [f'"{col}" VARCHAR' for col in RAW_NEW_COLUMNS]
+    create_new_table_sql = f'CREATE TABLE IF NOT EXISTS "{RAW_NEW_TABLE_NAME}" ({", ".join(new_column_defs)})'
+    con.execute(create_new_table_sql)
+    con.execute(f'DELETE FROM "{RAW_NEW_TABLE_NAME}"') # Clear existing data for fresh load
+    print(f"Table '{RAW_NEW_TABLE_NAME}' ensured and cleared.")
+
+    # --- Process and Load New Format Raw Data ---
+    print("\nProcessing NEW format data...")
+
+    new_data_iterator = process_directory(
+        directory_path=NEW_DATA_DIRECTORY,
+        record_xpath=NEW_ROADWORK_RECORD_XPATH,
+        extraction_func=extract_record_new_format,
+        nsmap=NSMAP
+    )
+    load_data_in_batches(con, RAW_NEW_TABLE_NAME, RAW_NEW_COLUMNS, new_data_iterator, batch_size)
+
+    # --- Create RAW OLD Table Structure if it doesn't exist ---
+    print(f"\nEnsuring table exists: {RAW_OLD_TABLE_NAME}")
+    old_column_defs = [f'"{col}" VARCHAR' for col in RAW_OLD_COLUMNS]
+    create_old_table_sql = f'CREATE TABLE IF NOT EXISTS "{RAW_OLD_TABLE_NAME}" ({", ".join(old_column_defs)})'
+    con.execute(create_old_table_sql)
+    con.execute(f'DELETE FROM "{RAW_OLD_TABLE_NAME}"') # Clear existing data for fresh load
+    print(f"Table '{RAW_OLD_TABLE_NAME}' ensured and cleared.")
+
+    # --- Process and Load Old Format Raw Data ---
+    print("\nProcessing OLD format data...")
+    old_data_iterator = process_directory(
+        directory_path=OLD_DATA_DIRECTORY,
+        record_xpath=OLD_ROADWORK_RECORD_XPATH,
+        extraction_func=extract_record_old_format,
+        nsmap=None 
+    )
+    load_data_in_batches(con, RAW_OLD_TABLE_NAME, RAW_OLD_COLUMNS, old_data_iterator, batch_size)
+
+    con.commit()
+    print("\nRaw data loading transaction committed.")
+
+    # Verify final counts
+    count_new_df = run_query_df(con, f'SELECT COUNT(*) as count FROM "{RAW_NEW_TABLE_NAME}"')
+    count_old_df = run_query_df(con, f'SELECT COUNT(*) as count FROM "{RAW_OLD_TABLE_NAME}"')
+    if count_new_df is not None: print(f"Verification: Table '{RAW_NEW_TABLE_NAME}' now contains {count_new_df[0, 'count']} rows.")
+    if count_old_df is not None: print(f"Verification: Table '{RAW_OLD_TABLE_NAME}' now contains {count_old_df[0, 'count']} rows.")
+else:
+    print("Database connection not established. Skipping raw data loading.")
+
+# %% [markdown]
+# ## C. Perform Data Type Conversions on Staging Tables
+
+# %%
+# Numeric Conversions
+if con:
+    print(f"--- Adding Numeric Columns and Converting Data ---")
+    # --- Process RAW_NEW_TABLE_NAME ---
+    print(f"\n--- Processing table for numeric conversion: {RAW_NEW_TABLE_NAME} ---")
+    cols_to_convert_new_numeric = { "OLD_REFERENCE_NUMBER": "BIGINT", "CENTRE_EASTING": "INTEGER", "CENTRE_NORTHING": "INTEGER" }
+    for original_col, numeric_type in cols_to_convert_new_numeric.items():
+        new_col_name = f"{original_col}_NUMERIC"
+        con.execute(f'ALTER TABLE "{RAW_NEW_TABLE_NAME}" ADD COLUMN IF NOT EXISTS "{new_col_name}" {numeric_type};')
+        con.execute(f'UPDATE "{RAW_NEW_TABLE_NAME}" SET "{new_col_name}" = TRY_CAST("{original_col}" AS {numeric_type});')
+    print(f"Numeric columns processed for {RAW_NEW_TABLE_NAME}.")
+
+    # --- Process RAW_OLD_TABLE_NAME ---
+    print(f"\n--- Processing table for numeric conversion: {RAW_OLD_TABLE_NAME} ---")
+    cols_to_convert_old_numeric = { "reference_number": "BIGINT", "centre_easting": "INTEGER", "centre_northing": "INTEGER" }
+    for original_col, numeric_type in cols_to_convert_old_numeric.items():
+        new_col_name = f"{original_col}_numeric"
+        con.execute(f'ALTER TABLE "{RAW_OLD_TABLE_NAME}" ADD COLUMN IF NOT EXISTS "{new_col_name}" {numeric_type};')
+        con.execute(f'UPDATE "{RAW_OLD_TABLE_NAME}" SET "{new_col_name}" = TRY_CAST("{original_col}" AS {numeric_type});')
+    print(f"Numeric columns processed for {RAW_OLD_TABLE_NAME}.")
+    con.commit()
+    print("\nNumeric conversion changes committed.")
+else:
+    print("Database connection not established. Skipping numeric conversions.")
+
+# %%
+# Datetime Conversions
+if con:
+    print(f"--- Adding Timestamp Columns and Converting Data ---")
+    # --- Process RAW_NEW_TABLE_NAME ---
+    print(f"\n--- Processing table for datetime conversion: {RAW_NEW_TABLE_NAME} ---")
+    cols_to_convert_new_dt = {
+        "SDATE": {"new_col": "SDATE_DT", "format": "%d-%b-%Y %H:%M"},
+        "EDATE": {"new_col": "EDATE_DT", "format": "%d-%b-%Y %H:%M"},
+        "PUBLISHED_DATE": {"new_col": "PUBLISHED_DATE_DT", "format": "ISO"}
+    }
+    for original_col, details in cols_to_convert_new_dt.items():
+        new_col_name = details["new_col"]
+        original_format = details["format"]
+        con.execute(f'ALTER TABLE "{RAW_NEW_TABLE_NAME}" ADD COLUMN IF NOT EXISTS "{new_col_name}" TIMESTAMP;')
+        if original_format == "ISO":
+            con.execute(f'UPDATE "{RAW_NEW_TABLE_NAME}" SET "{new_col_name}" = TRY_CAST("{original_col}" AS TIMESTAMP);')
+        else:
+            con.execute(f'UPDATE "{RAW_NEW_TABLE_NAME}" SET "{new_col_name}" = TRY_STRPTIME(trim("{original_col}"), \'{original_format}\');')
+    print(f"Timestamp columns processed for {RAW_NEW_TABLE_NAME}.")
+
+    # --- Process RAW_OLD_TABLE_NAME ---
+    print(f"\n--- Processing table for datetime conversion: {RAW_OLD_TABLE_NAME} ---")
+    cols_to_convert_old_dt = {
+        "start_date": {"new_col": "start_date_dt", "format": "ISO"},
+        "end_date": {"new_col": "end_date_dt", "format": "ISO"},
+        "published_date": {"new_col": "published_date_dt", "format": "ISO"}
+    }
+    for original_col, details in cols_to_convert_old_dt.items():
+        new_col_name = details["new_col"]
+        con.execute(f'ALTER TABLE "{RAW_OLD_TABLE_NAME}" ADD COLUMN IF NOT EXISTS "{new_col_name}" TIMESTAMP;')
+        con.execute(f'UPDATE "{RAW_OLD_TABLE_NAME}" SET "{new_col_name}" = TRY_CAST("{original_col}" AS TIMESTAMP);')
+    print(f"Timestamp columns processed for {RAW_OLD_TABLE_NAME}.")
+    con.commit()
+    print("\nDatetime conversion changes committed.")
+else:
+    print("Database connection not established. Skipping datetime conversions.")
+
+# %% [markdown]
+# ## D. Perform Coordinate System Conversion (OSGB36 to WGS84)
+
+# %%
+if con:
+    print(f"--- Converting Coordinates to WGS84 ---")
+    try:
+        con.execute("INSTALL spatial; LOAD spatial;")
+        gsb_file_path = 'OSTN15_NTv2_OSGBtoETRS.gsb' # Assumed to be in the working directory or accessible path
+        
+        source_crs_epsg27700 = 'EPSG:27700'
+        source_crs_nadgrids = f'+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +units=m +no_defs +nadgrids={gsb_file_path} +type=crs'
+        target_crs_epsg = 'EPSG:4326'
+        chosen_source_crs = source_crs_epsg27700 # Default
+        crs_method_message = f"Using '{source_crs_epsg27700}' (fallback)."
+
+        if os.path.exists(gsb_file_path):
+            # Simple test with nadgrids to see if it works without erroring out immediately
+            try:
+                test_nad_df = run_query_df(con, f"SELECT ST_Transform(ST_Point(529090, 179645), '{source_crs_nadgrids}', '{target_crs_epsg}', always_xy := true) AS test_geom;")
+                if test_nad_df is not None and not test_nad_df.is_empty() and test_nad_df[0, "test_geom"] is not None:
+                     # Check if result is not inf
+                    test_val_x = run_query_df(con, f"SELECT ST_X(ST_Transform(ST_Point(529090, 179645), '{source_crs_nadgrids}', '{target_crs_epsg}', always_xy := true)) as val;")
+                    if test_val_x is not None and abs(test_val_x[0,'val']) != float('inf'):
+                        chosen_source_crs = source_crs_nadgrids
+                        crs_method_message = f"Using '{source_crs_nadgrids}' (more accurate, with GSB file)."
+                    else:
+                        print(f"Warning: NADGRIDS transformation resulted in INF, falling back to {source_crs_epsg27700}.")
+                else:
+                    print(f"Warning: NADGRIDS transformation test failed or returned empty/null, falling back to {source_crs_epsg27700}.")
+            except Exception as e_nad:
+                print(f"Warning: NADGRIDS transformation test failed with error: {e_nad}. Falling back to {source_crs_epsg27700}.")
+        else:
+            print(f"INFO: GSB file '{gsb_file_path}' not found. Using '{source_crs_epsg27700}'.")
+        
+        print(crs_method_message)
+
+        tables_to_transform = {
+            RAW_NEW_TABLE_NAME: {"easting_col": "CENTRE_EASTING_NUMERIC", "northing_col": "CENTRE_NORTHING_NUMERIC"},
+            RAW_OLD_TABLE_NAME: {"easting_col": "centre_easting_numeric", "northing_col": "centre_northing_numeric"}
+        }
+
+        for table_name, cols_info in tables_to_transform.items():
+            easting_col = cols_info["easting_col"]
+            northing_col = cols_info["northing_col"]
+            print(f"\nProcessing table for coordinate conversion: {table_name}")
+            
+            con.execute(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS longitude_wgs84 DOUBLE;')
+            con.execute(f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS latitude_wgs84 DOUBLE;')
+            con.execute(f'UPDATE "{table_name}" SET longitude_wgs84 = NULL, latitude_wgs84 = NULL;') # Clear existing
+
+            update_sql = f'''
+            UPDATE "{table_name}"
+            SET
+                longitude_wgs84 = ST_X(ST_Transform(ST_Point("{easting_col}", "{northing_col}"), '{chosen_source_crs}', '{target_crs_epsg}', always_xy := true)),
+                latitude_wgs84 = ST_Y(ST_Transform(ST_Point("{easting_col}", "{northing_col}"), '{chosen_source_crs}', '{target_crs_epsg}', always_xy := true))
+            WHERE "{easting_col}" IS NOT NULL AND "{northing_col}" IS NOT NULL AND "{easting_col}" != 0 AND "{northing_col}" != 0;
+            '''
+            con.execute(update_sql)
+            print(f"Coordinate transformation complete for {table_name}.")
+        
+        con.commit()
+        print("\nCoordinate transformation changes committed.")
+
+    except Exception as e:
+        print(f"An error occurred during coordinate transformation: {e}")
+        if con: con.rollback()
+else:
+    print("Database connection not established. Skipping coordinate conversions.")
+
+# Display some samples with new WGS84 coordinates
+if con and chosen_source_crs:
+    print(f"\nSample from '{RAW_NEW_TABLE_NAME}' with WGS84 coordinates:")
+    sample_new_coords = run_query_df(con, f'SELECT "NEW_EVENT_NUMBER", "CENTRE_EASTING_NUMERIC", "CENTRE_NORTHING_NUMERIC", longitude_wgs84, latitude_wgs84 FROM "{RAW_NEW_TABLE_NAME}" WHERE longitude_wgs84 IS NOT NULL LIMIT 3')
+    if sample_new_coords is not None: display(sample_new_coords)
+
+    print(f"\nSample from '{RAW_OLD_TABLE_NAME}' with WGS84 coordinates:")
+    sample_old_coords = run_query_df(con, f'SELECT "reference_number", "centre_easting_numeric", "centre_northing_numeric", longitude_wgs84, latitude_wgs84 FROM "{RAW_OLD_TABLE_NAME}" WHERE longitude_wgs84 IS NOT NULL LIMIT 3')
+    if sample_old_coords is not None: display(sample_old_coords)
+
+# %% [markdown]
+# ## E. Create unified table
+
+# %%
+# --- 1. Define and Create Unified Table ---
+# Uses the transformed columns (_NUMERIC, _DT, WGS84) from the raw tables.
+
+create_temp_unified_table_sql = f"""
+CREATE OR REPLACE TABLE "{TEMP_UNIFIED_TABLE_NAME}" (
+    event_id VARCHAR,                        -- NEW_EVENT_NUMBER (new) or reference_number (old)
+    legacy_reference_id BIGINT,              -- OLD_REFERENCE_NUMBER_NUMERIC (new)
+    start_datetime TIMESTAMP,                -- SDATE_DT (new) or start_date_dt (old)
+    end_datetime TIMESTAMP,                  -- EDATE_DT (new) or end_date_dt (old)
+    published_datetime TIMESTAMP,            -- PUBLISHED_DATE_DT (new) or published_date_dt (old)
+    expected_delay VARCHAR,                  -- EXPDEL (new) or expected_delay (old)
+    description VARCHAR,                     -- DESCRIPTION (new) or description (old)
+    closure_type VARCHAR,                    -- CLOSURE_TYPE (new) or closure_type (old)
+    status VARCHAR,                          -- STATUS (new) or status (old)
+    road_names VARCHAR,                      -- ROAD_NUMBERS (new) or road (old)
+    easting_osgb INTEGER,                    -- CENTRE_EASTING_NUMERIC (new) or centre_easting_numeric (old)
+    northing_osgb INTEGER,                   -- CENTRE_NORTHING_NUMERIC (new) or centre_northing_numeric (old)
+    longitude_wgs84 DOUBLE,
+    latitude_wgs84 DOUBLE,
+    location_detail VARCHAR,                 -- location (old only)
+    local_authority VARCHAR,                 -- local_authority (old only)
+    traffic_management_type VARCHAR,         -- traffic_management (old only)
+    source_filename VARCHAR,
+    data_source_format VARCHAR              -- 'new_xml' or 'old_xml'
+);
+"""
+if con:
+    con.execute(create_temp_unified_table_sql)
+    print(f"Temporary table '{TEMP_UNIFIED_TABLE_NAME}' created/re-created successfully.")
+
+    # --- 2. Populate Unified Table from New Format Data ---
+    insert_from_new_sql = f"""
+    INSERT INTO "{TEMP_UNIFIED_TABLE_NAME}"
+    SELECT
+        "NEW_EVENT_NUMBER" AS event_id,
+        "OLD_REFERENCE_NUMBER_NUMERIC" AS legacy_reference_id,
+        "SDATE_DT" AS start_datetime,
+        "EDATE_DT" AS end_datetime,
+        "PUBLISHED_DATE_DT" AS published_datetime,
+        "EXPDEL" AS expected_delay,
+        "DESCRIPTION" AS description,
+        "CLOSURE_TYPE" AS closure_type,
+        "STATUS" AS status,
+        "ROAD_NUMBERS" AS road_names,
+        "CENTRE_EASTING_NUMERIC" AS easting_osgb,
+        "CENTRE_NORTHING_NUMERIC" AS northing_osgb,
+        longitude_wgs84,
+        latitude_wgs84,
+        NULL AS location_detail,
+        NULL AS local_authority,
+        NULL AS traffic_management_type,
+        source_filename,
+        'new_xml' AS data_source_format
+    FROM "{RAW_NEW_TABLE_NAME}";
+    """
+    con.execute(insert_from_new_sql)
+    print(f"Data inserted from '{RAW_NEW_TABLE_NAME}' into '{TEMP_UNIFIED_TABLE_NAME}'.")
+
+    # --- 3. Populate Unified Table from Old Format Data ---
+    insert_from_old_sql = f"""
+    INSERT INTO "{TEMP_UNIFIED_TABLE_NAME}"
+    SELECT
+        "reference_number" AS event_id, -- Using original string ID, could also use reference_number_numeric if desired and schema changed
+        NULL AS legacy_reference_id,
+        "start_date_dt" AS start_datetime,
+        "end_date_dt" AS end_datetime,
+        "published_date_dt" AS published_datetime,
+        "expected_delay" AS expected_delay,
+        "description" AS description,
+        "closure_type" AS closure_type,
+        "status" AS status,
+        "road" AS road_names,
+        "centre_easting_numeric" AS easting_osgb,
+        "centre_northing_numeric" AS northing_osgb,
+        longitude_wgs84,
+        latitude_wgs84,
+        "location" AS location_detail,
+        "local_authority" AS local_authority,
+        "traffic_management" AS traffic_management_type,
+        source_filename,
+        'old_xml' AS data_source_format
+    FROM "{RAW_OLD_TABLE_NAME}";
+    """
+    con.execute(insert_from_old_sql)
+    print(f"Data inserted from '{RAW_OLD_TABLE_NAME}' into '{TEMP_UNIFIED_TABLE_NAME}'.")
+
+    # --- 4. Verification (Example) ---
+    print(f"\n--- Verifying {TEMP_UNIFIED_TABLE_NAME} ---")
+    total_rows_unified_df = run_query_df(con, f'SELECT COUNT(*) as count FROM "{TEMP_UNIFIED_TABLE_NAME}"')
+    if total_rows_unified_df is not None:
+        print(f"Total rows in '{TEMP_UNIFIED_TABLE_NAME}': {total_rows_unified_df[0, 'count']}")
+
+    print(f"\nSample of 5 rows from '{TEMP_UNIFIED_TABLE_NAME}':")
+    sample_unified_df = run_query_df(con, f'SELECT * FROM "{TEMP_UNIFIED_TABLE_NAME}" LIMIT 5')
+    if sample_unified_df is not None:
+        display(sample_unified_df)
+
+    con.commit()
+    print("Changes for temporary unified table committed.")
+else:
+    print("Database connection not established. Skipping temporary unified table creation and population.")
+
+# %% [markdown]
+# ## F. Final Data Quality Checks on Unified Table
+
+# %% [markdown]
+# ### F.1. Unique Categorical Values
+
+# %%
+pl.Config.set_tbl_rows(20)
+
+# Define common placeholders for checking original string values
+PLACEHOLDERS_STRINGS = ["", "none", "n/a", "null", "unknown"]
+PLACEHOLDERS_SQL_LIST_STR = f"({', '.join([f'{pl!r}' for pl in PLACEHOLDERS_STRINGS])})"
+
+categorical_columns_unified = [
+    'expected_delay',
+    'closure_type',
+    'status',
+    'road_names',
+    'local_authority',
+    'traffic_management_type',
+    'data_source_format',
+]
+print(f"\n--- Unique Categorical Values in '{TEMP_UNIFIED_TABLE_NAME}' ---")
+for col in categorical_columns_unified:
+    print(f"\nDistinct values for '{col}':")
+    query = f"""
+        SELECT "{col}", COUNT(*) as count
+        FROM "{TEMP_UNIFIED_TABLE_NAME}"
+        GROUP BY "{col}"
+        ORDER BY count DESC;
+    """
+    df = run_query_df(con, query)
+    if df is not None:
+        display(df)
+    else:
+        print(f"Could not retrieve distinct values for '{col}'.")
+
+# %% [markdown]
+# ### F.2. Validate Date Ranges (End Date before Start Date)
+
+# %%
+print(f"\n--- Checking for Invalid Date Ranges in '{TEMP_UNIFIED_TABLE_NAME}' (end_datetime < start_datetime) ---")
+query_invalid_dates = f"""
+    SELECT event_id, source_filename, start_datetime, end_datetime, description
+    FROM "{TEMP_UNIFIED_TABLE_NAME}"
+    WHERE end_datetime < start_datetime;
+"""
+df_invalid_dates = run_query_df(con, query_invalid_dates)
+if df_invalid_dates is not None:
+    if not df_invalid_dates.is_empty():
+        print(f"Found {df_invalid_dates.height} records where end_datetime is before start_datetime:")
+        display(df_invalid_dates)
+    else:
+        print("No records found where end_datetime is before start_datetime.")
+else:
+    print("Could not execute query to check for invalid date ranges.")
+
+# %% [markdown]
+# ### F.3. Extreme Coordinate Check (WGS84)
+
+# %%
+print(f"\n--- Extreme Coordinates in '{TEMP_UNIFIED_TABLE_NAME}' (WGS84) ---")
+extreme_coords_queries = {
+    "Northmost": f"""SELECT event_id, description, road_names, latitude_wgs84, longitude_wgs84, source_filename FROM "{TEMP_UNIFIED_TABLE_NAME}" WHERE latitude_wgs84 IS NOT NULL ORDER BY latitude_wgs84 DESC LIMIT 1""",
+    "Southmost": f"""SELECT event_id, description, road_names, latitude_wgs84, longitude_wgs84, source_filename FROM "{TEMP_UNIFIED_TABLE_NAME}" WHERE latitude_wgs84 IS NOT NULL ORDER BY latitude_wgs84 ASC LIMIT 1""",
+    "Eastmost":  f"""SELECT event_id, description, road_names, latitude_wgs84, longitude_wgs84, source_filename FROM "{TEMP_UNIFIED_TABLE_NAME}" WHERE longitude_wgs84 IS NOT NULL ORDER BY longitude_wgs84 DESC LIMIT 1""",
+    "Westmost":  f"""SELECT event_id, description, road_names, latitude_wgs84, longitude_wgs84, source_filename FROM "{TEMP_UNIFIED_TABLE_NAME}" WHERE longitude_wgs84 IS NOT NULL ORDER BY longitude_wgs84 ASC LIMIT 1"""
+}
+for name, query in extreme_coords_queries.items():
+    print(f"\n{name} point:")
+    df_coord = run_query_df(con, query)
+    if df_coord is not None:
+        display(df_coord)
+    else:
+        print(f"Could not retrieve {name} coordinate.")
+
+# %% [markdown]
+# ### F.4. Type Conversion Discrepancy Checks (Unified NULL vs. Raw Original Not NULL/Placeholder)
+
+# %%
+print(f"\n--- Checking Numeric Conversion Discrepancies ---")
+# Numeric: legacy_reference_id, easting_osgb, northing_osgb
+# Check legacy_reference_id (from new format OLD_REFERENCE_NUMBER)
+query_legacy_ref_fail = f"""
+SELECT u.event_id, u.source_filename, r."OLD_REFERENCE_NUMBER" as original_raw_value, u.legacy_reference_id
+FROM "{TEMP_UNIFIED_TABLE_NAME}" u
+JOIN "{RAW_NEW_TABLE_NAME}" r ON u.event_id = r."NEW_EVENT_NUMBER" AND u.source_filename = r.source_filename
+WHERE u.data_source_format = 'new_xml'
+    AND u.legacy_reference_id IS NULL
+    AND r."OLD_REFERENCE_NUMBER" IS NOT NULL
+    AND lower(trim(r."OLD_REFERENCE_NUMBER")) NOT IN {PLACEHOLDERS_SQL_LIST_STR}
+LIMIT 10;
+"""
+print("\nDiscrepancies for 'legacy_reference_id' (unified NULL, original raw was valid):")
+df_legacy_fail = run_query_df(con, query_legacy_ref_fail)
+if df_legacy_fail is not None: display(df_legacy_fail if not df_legacy_fail.is_empty() else "No discrepancies found.")
+
+# Check easting_osgb
+query_easting_fail_new = f"""
+SELECT u.event_id, u.source_filename, r."CENTRE_EASTING" as original_raw_value, u.easting_osgb
+FROM "{TEMP_UNIFIED_TABLE_NAME}" u
+JOIN "{RAW_NEW_TABLE_NAME}" r ON u.event_id = r."NEW_EVENT_NUMBER" AND u.source_filename = r.source_filename
+WHERE u.data_source_format = 'new_xml'
+    AND u.easting_osgb IS NULL
+    AND r."CENTRE_EASTING" IS NOT NULL
+    AND lower(trim(r."CENTRE_EASTING")) NOT IN {PLACEHOLDERS_SQL_LIST_STR}
+LIMIT 10;
+"""
+print("\nDiscrepancies for 'easting_osgb' from new_xml (unified NULL, original raw was valid):")
+df_easting_fail_new = run_query_df(con, query_easting_fail_new)
+if df_easting_fail_new is not None: display(df_easting_fail_new if not df_easting_fail_new.is_empty() else "No discrepancies found.")
+
+query_easting_fail_old = f"""
+SELECT u.event_id, u.source_filename, r."centre_easting" as original_raw_value, u.easting_osgb
+FROM "{TEMP_UNIFIED_TABLE_NAME}" u
+JOIN "{RAW_OLD_TABLE_NAME}" r ON u.event_id = r."reference_number" AND u.source_filename = r.source_filename
+WHERE u.data_source_format = 'old_xml'
+    AND u.easting_osgb IS NULL
+    AND r."centre_easting" IS NOT NULL
+    AND lower(trim(r."centre_easting")) NOT IN {PLACEHOLDERS_SQL_LIST_STR}
+LIMIT 10;
+"""
+print("\nDiscrepancies for 'easting_osgb' from old_xml (unified NULL, original raw was valid):")
+df_easting_fail_old = run_query_df(con, query_easting_fail_old)
+if df_easting_fail_old is not None: display(df_easting_fail_old if not df_easting_fail_old.is_empty() else "No discrepancies found.")
+
+# Similar checks for northing_osgb can be added here following the pattern for easting_osgb
+print("\n(Skipping northing_osgb check for brevity, pattern is similar to easting_osgb)")
+
+# %%
+print(f"\n--- Checking Datetime Conversion Discrepancies ---")
+# Datetime: start_datetime, end_datetime, published_datetime
+# Check start_datetime
+query_start_dt_fail_new = f"""
+SELECT u.event_id, u.source_filename, r."SDATE" as original_raw_value, u.start_datetime
+FROM "{TEMP_UNIFIED_TABLE_NAME}" u
+JOIN "{RAW_NEW_TABLE_NAME}" r ON u.event_id = r."NEW_EVENT_NUMBER" AND u.source_filename = r.source_filename
+WHERE u.data_source_format = 'new_xml'
+    AND u.start_datetime IS NULL
+    AND r."SDATE" IS NOT NULL
+    AND lower(trim(r."SDATE")) NOT IN {PLACEHOLDERS_SQL_LIST_STR}
+LIMIT 10;
+"""
+print("\nDiscrepancies for 'start_datetime' from new_xml (unified NULL, original raw was valid):")
+df_start_dt_fail_new = run_query_df(con, query_start_dt_fail_new)
+if df_start_dt_fail_new is not None: display(df_start_dt_fail_new if not df_start_dt_fail_new.is_empty() else "No discrepancies found.")
+
+query_start_dt_fail_old = f"""
+SELECT u.event_id, u.source_filename, r."start_date" as original_raw_value, u.start_datetime
+FROM "{TEMP_UNIFIED_TABLE_NAME}" u
+JOIN "{RAW_OLD_TABLE_NAME}" r ON u.event_id = r."reference_number" AND u.source_filename = r.source_filename
+WHERE u.data_source_format = 'old_xml'
+    AND u.start_datetime IS NULL
+    AND r."start_date" IS NOT NULL
+    AND lower(trim(r."start_date")) NOT IN {PLACEHOLDERS_SQL_LIST_STR}
+LIMIT 10;
+"""
+print("\nDiscrepancies for 'start_datetime' from old_xml (unified NULL, original raw was valid):")
+df_start_dt_fail_old = run_query_df(con, query_start_dt_fail_old)
+if df_start_dt_fail_old is not None: display(df_start_dt_fail_old if not df_start_dt_fail_old.is_empty() else "No discrepancies found.")
+
+# Similar checks for end_datetime and published_datetime can be added here
+print("\n(Skipping end_datetime and published_datetime checks for brevity, pattern is similar)")
+
+# %% [markdown]
+# ### F.5. WGS84 Coordinate Conversion Check
+
+# %%
+print(f"\n--- Checking WGS84 Coordinate Conversion Failures (WGS84 NULL but OSGB Not NULL) ---")
+query_wgs84_fail = f"""
+    SELECT event_id, source_filename, easting_osgb, northing_osgb, longitude_wgs84, latitude_wgs84, description
+    FROM "{TEMP_UNIFIED_TABLE_NAME}"
+    WHERE (longitude_wgs84 IS NULL OR latitude_wgs84 IS NULL)
+        AND easting_osgb IS NOT NULL AND northing_osgb IS NOT NULL 
+        AND easting_osgb != 0 AND northing_osgb != 0 /* Exclude (0,0) OSGB as potentially invalid input */
+    LIMIT 20;
+"""
+df_wgs84_fail = run_query_df(con, query_wgs84_fail)
+if df_wgs84_fail is not None:
+    if not df_wgs84_fail.is_empty():
+        print(f"Found {df_wgs84_fail.height} records where WGS84 coordinates are NULL but OSGB coordinates were present and non-zero:")
+        display(df_wgs84_fail)
+    else:
+        print("No records found where WGS84 is NULL but OSGB was validly populated (and non-zero).")
+else:
+    print("Could not execute check for WGS84 conversion failures.")
+
+# %% [markdown]
+# ## G. Placeholder Removal
+# ### G.1. Identify Placeholder Values
+# 
+# Note: for 'traffic_management_type', 'None' will not be considered a placeholder value.
+
+# %%
+print(f"\n--- H.1 Identifying Placeholder Values in Deduplicated Table ---")
+
+# Define common placeholders (lowercase for case-insensitive comparison)
+PLACEHOLDER_STRINGS = ["", "none", "n/a", "null", "unknown", "na", "nill", "nil"] 
+PLACEHOLDERS_SQL_LIST_STR = f"({', '.join([f'{pl!r}' for pl in PLACEHOLDER_STRINGS])})"
+
+# Columns to check for placeholders (typically VARCHAR columns that are not IDs or controlled values)
+# Based on the unified table schema
+columns_to_check_for_placeholders = [
+    'expected_delay',
+    'description',
+    'closure_type',
+    'status',
+    'road_names',
+    'location_detail',
+    'local_authority',
+    'event_id'
+    # 'traffic_management_type', # Excluded, as 'None' here is a valid value
+]
+
+# Dynamically build the WHERE clause conditions
+conditions = []
+if columns_to_check_for_placeholders: # Check if the list itself is not empty
+    for col in columns_to_check_for_placeholders:
+        # 'traffic_management_type' is excluded from columns_to_check_for_placeholders,
+        # so no special handling is needed. We use the global PLACEHOLDERS_SQL_LIST_STR.
+        conditions.append(f'(lower(trim("{col}")) IN {PLACEHOLDERS_SQL_LIST_STR})')
+
+if not conditions:
+    print("No columns specified to check for placeholders.")
+else:
+    where_clause = " OR ".join(conditions)
+    
+    placeholder_query = f"""
+        SELECT *
+        FROM "{TEMP_UNIFIED_TABLE_NAME}"
+        WHERE {where_clause};
+    """
+    
+    print(f"Querying for rows with placeholders in columns: {', '.join(columns_to_check_for_placeholders)}")
+    # print(f"Using query: {placeholder_query}") # For debugging the query
+    
+    df_rows_with_placeholders = run_query_df(con, placeholder_query)
+    
+    if df_rows_with_placeholders is not None:
+        if not df_rows_with_placeholders.is_empty():
+            print(f"\nFound {df_rows_with_placeholders.height} row(s) in '{TEMP_UNIFIED_TABLE_NAME}' containing placeholder values:")
+            display(df_rows_with_placeholders.head(10))
+            
+            print("\nSummary of placeholders found per column (for the retrieved sample):")
+            summary_data = []
+            for col_to_check in columns_to_check_for_placeholders:
+                if col_to_check in df_rows_with_placeholders.columns:
+                    # Determine which placeholder list to use for Polars filtering
+                    current_polars_placeholders = list(PLACEHOLDER_STRINGS) # Make a mutable copy
+                    if col_to_check == 'traffic_management_type':
+                        # For 'traffic_management_type', exclude "none" from Polars check
+                        if "none" in current_polars_placeholders:
+                            current_polars_placeholders.remove("none")
+                    
+                    # Filter only if there are placeholders to check for this column
+                    if current_polars_placeholders:
+                        placeholder_count_in_col = df_rows_with_placeholders.filter(
+                            pl.col(col_to_check).str.to_lowercase().str.strip_chars().is_in(current_polars_placeholders)
+                        ).height
+                        if placeholder_count_in_col > 0:
+                            summary_data.append({"Column": col_to_check, "Rows with Placeholder in Sample": placeholder_count_in_col})
+            if summary_data:
+                display(pl.DataFrame(summary_data))
+
+        else:
+            print(f"No rows found in '{TEMP_UNIFIED_TABLE_NAME}' with the specified placeholder values in the checked columns (considering exclusions).")
+    else:
+        print(f"Could not execute query to find rows with placeholders in '{TEMP_UNIFIED_TABLE_NAME}'.")
+
+# %% [markdown]
+# ### G.2 NULL-ify String Placeholder Values
+
+# %%
+# Columns where placeholders should be replaced with NULLs
+columns_to_update_for_placeholders = [
+    'expected_delay',
+    'description',
+    'closure_type',
+    'status',
+    'road_names',
+    'location_detail',
+    'local_authority',
+    'event_id'
+    # 'traffic_management_type', # Excluded, as 'None' here is a valid value
+]
+
+PLACEHOLDER_STRINGS = ["", "none", "n/a", "null", "unknown", "na", "nill", "nil"] 
+
+statements_executed = 0
+
+# Build the IN clause string for SQL using all global PLACEHOLDER_STRINGS
+# This means "none" will be replaced by NULL if it's in PLACEHOLDER_STRINGS for the columns listed above.
+sql_placeholders_in_clause = f"({', '.join([f'{pl!r}' for pl in PLACEHOLDER_STRINGS])})"
+
+for col_to_update in columns_to_update_for_placeholders:
+    update_sql = f"""
+    UPDATE "{TEMP_UNIFIED_TABLE_NAME }"
+    SET "{col_to_update}" = NULL
+    WHERE lower(trim("{col_to_update}")) IN {sql_placeholders_in_clause};
+    """
+    
+    try:
+        print(f"  Attempting to replace placeholders in column: '{col_to_update}' with NULLs...")
+        con.execute(update_sql)
+        print(f"    Successfully executed NULL replacement query for '{col_to_update}'.")
+        statements_executed += 1
+    except Exception as e:
+        print(f"    Error updating column '{col_to_update}': {e}")
+
+if statements_executed > 0:
+    try:
+        con.commit()
+        print(f"\nChanges committed to the database. {statements_executed} column(s) processed for placeholder replacement.")
+    except Exception as e:
+        print(f"Error committing changes: {e}")
+        if con:
+            try:
+                con.rollback()
+                print("Transaction rolled back.")
+            except Exception as rb_e:
+                print(f"Rollback failed: {rb_e}")
+else:
+    print("\nNo update statements were executed, so no changes to commit.")
+
+# --- Verification Step (Simplified) ---
+print("\n--- Verification: Checking for remaining placeholders after replacement ---")
+
+verification_conditions = []
+# The verification will use the same global PLACEHOLDER_STRINGS
+# and the simplified columns_to_update_for_placeholders list.
+for col_verify in columns_to_update_for_placeholders: 
+    verification_conditions.append(f'(lower(trim("{col_verify}")) IN {sql_placeholders_in_clause})')
+
+if not verification_conditions:
+    print("No columns/conditions specified for verification of remaining placeholders.")
+else:
+    verification_where_clause = " OR ".join(verification_conditions)
+    
+    verification_query = f"""
+        SELECT *
+        FROM "{TEMP_UNIFIED_TABLE_NAME }"
+        WHERE {verification_where_clause}
+        LIMIT 10; 
+    """
+    print(f"Querying for remaining placeholders in columns: {', '.join(columns_to_update_for_placeholders)}")
+    df_remaining_placeholders = run_query_df(con, verification_query)
+    
+    if df_remaining_placeholders is not None:
+        if not df_remaining_placeholders.is_empty():
+            print(f"\nFound {df_remaining_placeholders.height} row(s) (showing up to 10) still containing targeted placeholder values.")
+            display(df_remaining_placeholders)
+        else:
+            print(f"SUCCESS: No remaining targeted placeholder values found in the checked columns of '{TEMP_UNIFIED_TABLE_NAME }'.")
+    else:
+        print(f"Could not execute verification query for '{TEMP_UNIFIED_TABLE_NAME }'.")
+
+# %% [markdown]
+# ### G.4 NULL-ify Numeric Placeholder Values
+
+# %%
+coords_columns_to_update = ['longitude_wgs84', 'latitude_wgs84']
+coord_statements_executed = 0
+
+if con:
+    for col_to_update in coords_columns_to_update:
+        update_sql = f"""
+        UPDATE "{TEMP_UNIFIED_TABLE_NAME}"
+        SET "{col_to_update}" = NULL
+        WHERE "{col_to_update}" = 0;
+        """
+        try:
+            print(f"  Attempting to replace 0 in column: '{col_to_update}' with NULL...")
+            con.execute(update_sql)
+            # Log the number of rows affected if possible (DuckDB might require a different way to get this)
+            # For simplicity, just confirming execution here.
+            print(f"    Successfully executed NULL replacement query for 0s in '{col_to_update}'.")
+            coord_statements_executed += 1
+        except Exception as e:
+            print(f"    Error updating column '{col_to_update}' to replace 0s: {e}")
+
+    if coord_statements_executed > 0:
+        try:
+            con.commit()
+            print(f"\nChanges committed to the database. {coord_statements_executed} coordinate column(s) processed for 0 to NULL replacement.")
+        except Exception as e:
+            print(f"Error committing changes for coordinate 0 to NULL replacement: {e}")
+            if con:
+                try:
+                    con.rollback()
+                    print("Transaction rolled back.")
+                except Exception as rb_e:
+                    print(f"Rollback failed: {rb_e}")
+    else:
+        print("\nNo coordinate update statements for 0 to NULL were executed, so no changes to commit.")
+
+    # --- Verification Step ---
+    print(f"\n--- Verification: Checking for remaining 0 values in WGS84 coordinates in '{TEMP_UNIFIED_TABLE_NAME}' ---")
+    remaining_zeros_conditions = []
+    for col_verify in coords_columns_to_update:
+        remaining_zeros_conditions.append(f'("{col_verify}" = 0)')
+    
+    if not remaining_zeros_conditions:
+        print("No WGS84 columns specified for verification of remaining 0s.")
+    else:
+        verification_where_clause = " OR ".join(remaining_zeros_conditions)
+        
+        verification_query_coords = f"""
+            SELECT event_id, source_filename, longitude_wgs84, latitude_wgs84
+            FROM "{TEMP_UNIFIED_TABLE_NAME}"
+            WHERE {verification_where_clause}
+            LIMIT 10; 
+        """
+        print(f"Querying for remaining 0s in WGS84 columns: {', '.join(coords_columns_to_update)}")
+        df_remaining_zeros_coords = run_query_df(con, verification_query_coords)
+        
+        if df_remaining_zeros_coords is not None:
+            if not df_remaining_zeros_coords.is_empty():
+                print(f"\nFound {df_remaining_zeros_coords.height} row(s) (showing up to 10) still containing 0 values in WGS84 coordinates.")
+                display(df_remaining_zeros_coords)
+            else:
+                print(f"SUCCESS: No remaining 0 values found in the WGS84 coordinate columns of '{TEMP_UNIFIED_TABLE_NAME}'.")
+        else:
+            print(f"Could not execute verification query for 0s in WGS84 coordinates in '{TEMP_UNIFIED_TABLE_NAME}'.")
+else:
+    print("Database connection not established. Skipping 0 to NULL replacement in WGS84 coordinates.")
+
+# %% [markdown]
+# ## H. Duplicate removal
+
+# %% [markdown]
+# ### H.1. Identify Duplicates
+
+# %%
+temp_unified_table_info_df = run_query_df(con, f"PRAGMA table_info('{TEMP_UNIFIED_TABLE_NAME}');")
+if temp_unified_table_info_df is not None and not temp_unified_table_info_df.is_empty():
+    temp_unified_columns = [row['name'] for row in temp_unified_table_info_df.iter_rows(named=True)]
+    
+    group_by_columns_str_temp = ", ".join([f'"{col}"' for col in temp_unified_columns if col != 'source_filename'])
+
+    duplicate_row_query_temp = f"""
+        SELECT
+            COUNT(*) as duplicate_count,
+            {group_by_columns_str_temp}
+        FROM "{TEMP_UNIFIED_TABLE_NAME}"
+        GROUP BY {group_by_columns_str_temp}
+        HAVING COUNT(*) > 1
+        ORDER BY duplicate_count DESC;
+    """
+    
+    df_duplicate_rows_temp = run_query_df(con, duplicate_row_query_temp)
+
+    if df_duplicate_rows_temp is not None:
+        if not df_duplicate_rows_temp.is_empty():
+            print(f"Found {df_duplicate_rows_temp.height} sets of full row duplicates within the new data batch ('{TEMP_UNIFIED_TABLE_NAME}'):")
+            display(df_duplicate_rows_temp.head(5))
+        else:
+            print(f"No full row duplicates found within the new data batch ('{TEMP_UNIFIED_TABLE_NAME}').")
+    else:
+        print(f"Could not execute query to check for full row duplicates in '{TEMP_UNIFIED_TABLE_NAME}'.")
+
+# %% [markdown]
+# ### H.2 Creating a Deduplicated Table
+# 
+# Duplicates are defined by having the same values in all columns EXCEPT for `source_filename`.
+
+# %%
+# Schema for the DEDUPLICATED_TABLE_NAME is the same as TEMP_UNIFIED_TABLE_NAME
+# We can use the create_temp_unified_table_sql's column definitions part
+# This is a bit manual; a helper function to generate schema string would be cleaner for production
+schema_for_deduplicated_table = """
+(
+    event_id VARCHAR, legacy_reference_id BIGINT, start_datetime TIMESTAMP, end_datetime TIMESTAMP,
+    published_datetime TIMESTAMP, expected_delay VARCHAR, description VARCHAR, closure_type VARCHAR,
+    status VARCHAR, road_names VARCHAR, easting_osgb INTEGER, northing_osgb INTEGER,
+    longitude_wgs84 DOUBLE, latitude_wgs84 DOUBLE, location_detail VARCHAR, local_authority VARCHAR,
+    traffic_management_type VARCHAR, source_filename VARCHAR, data_source_format VARCHAR
+)
+"""
+con.execute(f"CREATE TABLE IF NOT EXISTS \"{UK_ROADWORKS_FINAL}\" {schema_for_deduplicated_table};")
+print(f"Ensured final deduplicated table '{UK_ROADWORKS_FINAL}' exists.")
+
+# Get column names for partitioning and selection
+# temp_unified_table_info_df should still be available from the previous (modified) cell,
+# or re-fetch if this cell is run independently.
+if temp_unified_table_info_df is None or temp_unified_table_info_df.is_empty():
+     temp_unified_table_info_df = run_query_df(con, f"PRAGMA table_info('{TEMP_UNIFIED_TABLE_NAME}');")
+
+if temp_unified_table_info_df is not None and not temp_unified_table_info_df.is_empty():
+    all_unified_columns = [row['name'] for row in temp_unified_table_info_df.iter_rows(named=True)]
+    
+    # Columns for defining a duplicate (all except source_filename)
+    columns_for_dedup_check = [col for col in all_unified_columns if col != 'source_filename']
+
+    if not columns_for_dedup_check:
+        print("Error: No columns available for deduplication check after excluding 'source_filename'.")
+    else:
+        select_columns_str = ", ".join([f'"{col}"' for col in all_unified_columns])
+        partition_by_columns_str = ", ".join([f'"{col}"' for col in columns_for_dedup_check])
+        
+        # Order to pick which row to keep within a duplicate group from the new batch
+        order_by_for_new_batch_dedup = '"published_datetime" ASC, "source_filename" ASC'
+
+        # Build the WHERE NOT EXISTS conditions string
+        # (col_a IS NOT DISTINCT FROM new_cand.col_a) AND (col_b IS NOT DISTINCT FROM new_cand.col_b) ...
+        not_exists_conditions = " AND ".join([f'(existing."{col}" IS NOT DISTINCT FROM new_cand."{col}")' for col in columns_for_dedup_check])
+
+        incremental_dedup_sql = f"""
+        WITH new_data_ranked AS (
+            SELECT 
+                *,
+                ROW_NUMBER() OVER (PARTITION BY {partition_by_columns_str} ORDER BY {order_by_for_new_batch_dedup}) as rn
+            FROM "{TEMP_UNIFIED_TABLE_NAME}"
+        ),
+        deduplicated_new_candidates AS (
+            SELECT {select_columns_str}
+            FROM new_data_ranked
+            WHERE rn = 1
+        )
+        INSERT INTO "{UK_ROADWORKS_FINAL}" ({select_columns_str})
+        SELECT {select_columns_str}
+        FROM deduplicated_new_candidates new_cand
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM "{UK_ROADWORKS_FINAL}" existing
+            WHERE {not_exists_conditions}
+        );
+        """
+        try:
+            print(f"Attempting to insert new, unique records from '{TEMP_UNIFIED_TABLE_NAME}' into '{UK_ROADWORKS_FINAL}'...")
+            # Get count before insert
+            count_before_df = run_query_df(con, f"SELECT COUNT(*) as count FROM \"{UK_ROADWORKS_FINAL}\"")
+            count_before = count_before_df[0, 'count'] if count_before_df is not None else 'N/A'
+
+            con.execute(incremental_dedup_sql)
+            
+            # Get count after insert
+            count_after_df = run_query_df(con, f"SELECT COUNT(*) as count FROM \"{UK_ROADWORKS_FINAL}\"")
+            count_after = count_after_df[0, 'count'] if count_after_df is not None else 'N/A'
+            
+            print(f"Incremental update of '{UK_ROADWORKS_FINAL}' complete.")
+            if count_before != 'N/A' and count_after != 'N/A':
+                print(f"Rows in '{UK_ROADWORKS_FINAL}' before: {count_before}, after: {count_after}. Inserted: {count_after - count_before}")
+            
+            con.commit()
+
+        except Exception as e:
+            print(f"Error during incremental deduplication: {e}")
+            if con: con.rollback()
+else:
+    print(f"Could not retrieve column information for table '{TEMP_UNIFIED_TABLE_NAME}', skipping incremental deduplication.")
+
+# %% [markdown]
+# ## Show final tables and their sizes
+
+# %%
+# Show all tables + their estimated sizes
+print("\n--- List of Tables in Database with Estimated Sizes ---")
+
+# Query to get table names and their estimated sizes from duckdb_tables()
+tables_info_query = """
+SELECT table_name, estimated_size, column_count
+FROM duckdb_tables()
+WHERE schema_name = 'main' -- 'main' is the default schema
+ORDER BY table_name;
+"""
+tables_df = run_query_df(con, tables_info_query)
+
+if tables_df is not None and not tables_df.is_empty():
+    display(tables_df)
+elif tables_df is not None and tables_df.is_empty():
+    print("No tables found in the 'main' schema.")
+else:
+    print("Could not retrieve table information from duckdb_tables().")
+
+# %%
+# Drop the temporary unified table after processing
+con.execute(f"DROP TABLE IF EXISTS \"{TEMP_UNIFIED_TABLE_NAME}\";")
+print(f"Temporary table '{TEMP_UNIFIED_TABLE_NAME}' dropped.")
+con.commit()
+con.close()
+
+
